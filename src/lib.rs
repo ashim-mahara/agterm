@@ -1,11 +1,11 @@
 use ptyprocess::PtyProcess;
 use std::fs::File;
-use std::ops::BitXor;
+// use std::ops::BitXor;
 use std::process::Command;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::thread::JoinHandle;
 use pyo3::prelude::*;
-use std::{str, string};
+use std::{str};
 use pyo3::types::PyModule;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::{thread, time, sync::Mutex};
@@ -186,7 +186,7 @@ impl TerminalEnv {
 
         let res = self.read_from_stream().unwrap();
         // res = self.initial_state.lock().unwrap().clone() + &res;
-        println!("\nRESULT_START {} RESULT_END", res);
+        // println!("\nRESULT_START {} RESULT_END", res);
         Ok(res)
     }
 }
@@ -194,7 +194,7 @@ impl TerminalEnv {
 //reads from reader and writes to the sender channel
 fn spawn_reader_channel<T>(mut reader: BufReader<File>, sender_channel: &Sender<String>, _timeout: i32) -> JoinHandle<()> {
     let tx = sender_channel.clone();
-    let mut len_buf: Vec<u8> = Vec::new();
+    // let mut len_buf: Vec<u8> = Vec::new();
 
     let handler = thread::Builder::new().name("blocking_reader_thread".to_string()).spawn(move || loop {
         thread::sleep(time::Duration::from_millis(5));
@@ -210,18 +210,18 @@ fn spawn_reader_channel<T>(mut reader: BufReader<File>, sender_channel: &Sender<
                 // println!("xor res: {:?}", &buffer[..num_bytes].cmp(&31));
                 // println!("escape char bool: {:?}", &buffer[..num_bytes].xor_bit(&[0b00011111u8]));
 
-                println!("<READER_READ_NUM_BYTES> {} <READER_READ_NUM_BYTES>", num_bytes);
+                // println!("<READER_READ_NUM_BYTES> {} <READER_READ_NUM_BYTES>", num_bytes);
                 // let byte_str = b"00011111";
                 // assert_eq!(byte_str, &*byte_vec);
 
-                print!("<READER_READ_RAW_BYTES> {:?} <READER_READ_RAW_BYTES>", &buffer[..num_bytes].escape_ascii().to_string());
+                // print!("<READER_READ_RAW_BYTES> {:?} <READER_READ_RAW_BYTES>", &buffer[..num_bytes].escape_ascii().to_string());
                 // print!("<READER_READ_BYTES_TO_STRING> {:?} <READER_READ_BYTES_TO_STRING>", &buffer[..num_bytes]);
 
                 // let line = String::from_utf8_lossy(&buffer[..num_bytes].escape_ascii().to_string()).to_string();
                 // let line = String::from_utf8();
                 let line = buffer[..num_bytes].escape_ascii().to_string();
                 if line.is_empty() {
-                    println!("breaking cause empty line");
+                    // println!("breaking cause empty line");
                     continue;
                 }
                 // println!("<READER_READ_STRING> {} <READER_READ_STRING>", line);
@@ -235,7 +235,7 @@ fn spawn_reader_channel<T>(mut reader: BufReader<File>, sender_channel: &Sender<
                     print!("Process Exited");
                     // println!("sleep indefinitely because of error 5");
                     // thread::sleep(time::Duration::from_secs(4000));
-                    println!("Reached EOF");
+                    // println!("Reached EOF");
                     // continue;
                     // println!("Reached EOF");
                     break;
@@ -254,7 +254,7 @@ pub fn read_from_channel(read_channel: Receiver<String>, timeout: i32) -> Result
     let mut buf: Vec<u8> = Vec::new();
     let timeout = 100;
 
-    println!("Reading from the stream");
+    // println!("Reading from the stream");
 
     // buf.extend_from_slice(self.initial_state.as_bytes());
     let mut consecutive_empty_lines = 0;
@@ -273,7 +273,7 @@ pub fn read_from_channel(read_channel: Receiver<String>, timeout: i32) -> Result
                 }
                 consecutive_empty_lines += 1;
                 if consecutive_empty_lines >= max_consecutive_empty_lines {
-                    println!("Breaking cause of consecutive empty lines");
+                    // println!("Breaking cause of consecutive empty lines");
                     break;
                 }
                 // break;
@@ -296,6 +296,7 @@ pub fn read_from_channel(read_channel: Receiver<String>, timeout: i32) -> Result
 
 /// A Python module implemented in Rust.
 #[pymodule(gil_used = false)]
+
 fn terminal_env(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TerminalEnv>()?;
     Ok(())
