@@ -1,2 +1,2 @@
-# llm-term
-Terminal for LLMs
+# AGTerm
+Terminal for Agents
