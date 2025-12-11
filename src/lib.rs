@@ -500,13 +500,18 @@ fn sanitize_for_agent(bytes: &[u8]) -> String {
     while i < bytes.len() {
         let b = bytes[i];
 
-        // ANSI CSI sequences
         if b == 0x1b {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            if i + 1 >= bytes.len() {
+                break;
+            }
+            let b2 = bytes[i + 1];
+
+            // CSI: ESC [ ... final-byte(@..~)
+            if b2 == b'[' {
                 i += 2;
                 while i < bytes.len() {
                     let c = bytes[i];
-                    if c >= 0x40 && c <= 0x7e {
+                    if (0x40..=0x7e).contains(&c) {
                         i += 1;
                         break;
                     }
@@ -514,21 +519,48 @@ fn sanitize_for_agent(bytes: &[u8]) -> String {
                 }
                 continue;
             }
-            // other ESC sequences: skip a byte or two
-            i += 1;
-            if i < bytes.len() {
-                i += 1;
+
+            // OSC: ESC ] ... BEL or ESC \
+            if b2 == b']' {
+                i += 2;
+                while i < bytes.len() {
+                    if bytes[i] == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
             }
+
+            // DCS / PM / APC: ESC P / ESC ^ / ESC _ ... ESC \
+            if b2 == b'P' || b2 == b'^' || b2 == b'_' {
+                i += 2;
+                while i < bytes.len() {
+                    if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+
+            // Other ESC sequences: skip ESC plus following byte.
+            i += 2;
             continue;
         }
 
-        // Control chars: keep \n \t, drop rest (except \r which we normalize away)
-        if b < 0x20 && b != b'\n' && b != b'\t' && b != b'\r' {
+        // Keep \n and \t, drop other control chars; normalize away \r
+        if b == b'\r' {
             i += 1;
             continue;
         }
-
-        if b == b'\r' {
+        if b < 0x20 && b != b'\n' && b != b'\t' {
             i += 1;
             continue;
         }
