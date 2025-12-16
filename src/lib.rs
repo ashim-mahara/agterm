@@ -573,7 +573,7 @@ fn sanitize_for_agent(bytes: &[u8]) -> String {
 }
 
 #[pymodule(name="agterm", gil_used = false)]
-fn ag_term(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn agterm(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AGTerm>()?;
     Ok(())
 }
