@@ -1,631 +1,300 @@
 use ptyprocess::PtyProcess;
-use pyo3::prelude::*;
-use pyo3::types::PyModule;
-use std::sync::{Arc, Mutex, MutexGuard};
-
-use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+// use std::ops::BitXor;
 use std::process::Command;
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use pyo3::prelude::*;
+use std::{str};
+use pyo3::types::PyModule;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::{thread, time, sync::Mutex};
 
-// Switched to flume channel (Send + Sync + Clone)
-use flume::{Sender, Receiver, RecvTimeoutError};
-
-const DEFAULT_TIMEOUT_MS: u64 = 20_000;
-const DEFAULT_SETTLE_MS: u64 = 200;
-const DEFAULT_QUIET_MS: u64 = 80;
-
-const DEFAULT_MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
-
-const DEFAULT_READY_MARKERS: [&str; 2] = ["pwndbg> ", "(gdb) "];
-
-// --- New internal structure to hold thread-safe state ---
-struct AGTermInner {
-    // Contains non-Send/Sync types (PtyProcess, File handle)
-    process: PtyProcess,
-    writer: BufWriter<File>,
-
-    // Shared mutable data
-    history: VecDeque<u8>,
-    max_history_bytes: usize,
-
-    command: String,
-    interactive: bool,
-    ready_markers: Vec<Vec<u8>>,
-}
-
-// CRITICAL FIX: Manually implement the Send marker trait.
-// This is required because PtyProcess and File handles are not automatically Send/Sync
-// but since they are wrapped and protected by an external Mutex, we assert that
-// it is logically safe to send the *container* across threads.
-// This relies entirely on the correct use of the Mutex in AGTerm.
-unsafe impl Send for AGTermInner {}
-
-// Removed #[pyclass(unsendable)] - now relies on fields being Send + Sync
 #[pyclass]
 struct AGTerm {
-    // Arc<Mutex<T>> makes the primary state Send + Sync if T is Send
-    inner: Arc<Mutex<AGTermInner>>,
-
-    // Flume Receiver is Send + Sync
-    rx: Arc<Receiver<Vec<u8>>>,
-
-    // Mutex protects the JoinHandle (which is not Sync)
-    reader_handle: Mutex<Option<JoinHandle<()>>>,
+    process: PtyProcess,
+    // buffer_write_channel: Sender<String>,
+    buffer_read_channel: Mutex<Receiver<String>>,
+    // buffer_writer: Mutex<BufWriter<File>>,
+    command: String,
+    // initial_state: Mutex<String>,
+    interactive: bool,
+    history: Mutex<String>,
+    read_offset: Mutex<usize>,
+    // read_handler: JoinHandle<()>
 }
+
 
 #[pymethods]
 impl AGTerm {
-    /// ready_markers is optional; if not provided, defaults to ["pwndbg> ", "(gdb) "]
-    /// If interactive=false, marker waiting is skipped and reads use "quiet" detection instead.
     #[new]
-    fn new(command: String, interactive: bool, ready_markers: Option<Vec<String>>, max_history_bytes: usize) -> PyResult<Self> {
-        // Convert input Strings to byte vectors before calling spawn_inner
-        let markers: Vec<Vec<u8>> = ready_markers.unwrap_or_else(|| {
-            DEFAULT_READY_MARKERS.iter().map(|s| s.to_string()).collect()
-        }).into_iter().map(|s| s.into_bytes()).collect();
+    fn new(command: String, interactive: bool) -> PyResult<Self> {
+        let os_command = Command::new(command.clone());
+        let process = match PtyProcess::spawn(os_command) {
+        // let process = match PtyProcess::spawn(Command::new("/tmp/test")) {
 
-        Self::spawn_inner(command, interactive, max_history_bytes, markers)
-    }
-
-    pub fn set_ready_markers(&self, ready_markers: Vec<String>) -> PyResult<()> {
-        let mut inner = self
-       .inner
-       .lock()
-       .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("internal lock poisoned"))?;
-
-        inner.ready_markers.clear();
-        for s in ready_markers {
-            inner.ready_markers.push(s.into_bytes());
-        }
-        Ok(())
-    }
-
-    #[pyo3(signature = (timeout_ms=None, max_output_bytes=None, settle_ms=None, quiet_ms=None))]
-    pub fn read_until_ready(
-        &self,
-        py: Python<'_>,
-        timeout_ms: Option<u64>,
-        max_output_bytes: Option<usize>,
-        settle_ms: Option<u64>,
-        quiet_ms: Option<u64>,
-    ) -> PyResult<String> {
-        let timeout_ms = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
-        let max_output_bytes = max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES);
-        let settle_ms = settle_ms.unwrap_or(DEFAULT_SETTLE_MS);
-        let quiet_ms = quiet_ms.unwrap_or(DEFAULT_QUIET_MS);
-
-        // Replaced deprecated py.allow_threads with py.detach
-        py.detach(|| {
-            let raw = if self.should_wait_for_markers() {
-                let (raw, _tr, _seen, _which) =
-                    self.read_until_ready_inner(timeout_ms, max_output_bytes, settle_ms)?;
-                raw
-            } else {
-                let (raw, _tr) = self.read_until_quiet_inner(timeout_ms, quiet_ms, max_output_bytes)?;
-                raw
-            };
-            Ok(sanitize_for_agent(&raw))
-        })
-    }
-
-    #[pyo3(signature = (input, timeout_ms=None, max_output_bytes=None, settle_ms=None, quiet_ms=None))]
-    pub fn send_and_read_until_ready(
-        &self,
-        py: Python<'_>,
-        input: &str,
-        timeout_ms: Option<u64>,
-        max_output_bytes: Option<usize>,
-        settle_ms: Option<u64>,
-        quiet_ms: Option<u64>,
-    ) -> PyResult<String> {
-        let timeout_ms = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
-        let max_output_bytes = max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES);
-        let settle_ms = settle_ms.unwrap_or(DEFAULT_SETTLE_MS);
-        let quiet_ms = quiet_ms.unwrap_or(DEFAULT_QUIET_MS);
-
-        self.write_to_stream(input)?;
-
-        // Replaced deprecated py.allow_threads with py.detach
-        py.detach(|| {
-            let raw = if self.should_wait_for_markers() {
-                let (raw, _tr, _seen, _which) =
-                    self.read_until_ready_inner(timeout_ms, max_output_bytes, settle_ms)?;
-                raw
-            } else {
-                let (raw, _tr) = self.read_until_quiet_inner(timeout_ms, quiet_ms, max_output_bytes)?;
-                raw
-            };
-            Ok(sanitize_for_agent(&raw))
-        })
-    }
-
-    /// Non-blocking read of buffered output.
-    #[pyo3(signature = (max_bytes=None))]
-    pub fn read_available(&self, max_bytes: Option<usize>) -> PyResult<String> {
-        let cap = max_bytes.unwrap_or(64 * 1024);
-        let mut out: Vec<u8> = Vec::new();
-
-        let rx = self.rx.as_ref();
-
-        while out.len() < cap {
-            match rx.try_recv() {
-                Ok(chunk) => {
-                    let remaining = cap - out.len();
-                    if chunk.len() <= remaining {
-                        out.extend_from_slice(&chunk);
-                    } else {
-                        out.extend_from_slice(&chunk[..remaining]);
-                        break;
-                    }
-                }
-                Err(_) => break,
+            Ok(process) => process,
+            Err(e) => {
+                println!("Failed to spawn a process with command: {}, Error: {}", command, e);
+                return Err(PyErr::new::<pyo3::exceptions::PyException, _>(format!("Failed to spawn a process with command: {}", command)));
             }
-        }
+        };
 
-        self.append_history(&out)?;
-        Ok(sanitize_for_agent(&out))
+        let stream = process.get_raw_handle().unwrap();
+        let reader = BufReader::new(stream.try_clone().unwrap());
+        let _buffer_writer_: Mutex<BufWriter<File>> = Mutex::new(BufWriter::new(stream));
+        let (sender_channel, receiver_channel): (Sender<String>, Receiver<String>) = channel();
+
+        let _read_handler_ = spawn_reader_channel::<File>(reader, &sender_channel.clone(), 10); // deal with later
+
+        // let buffer_write_channel = sender_channel.clone();
+        let buffer_read_channel = Mutex::new(receiver_channel);
+
+        Ok(AGTerm {
+            process,
+            // buffer_write_channel,
+            buffer_read_channel,
+            // buffer_writer,
+            command,
+            // initial_state: Mutex::new("".to_string()),
+            interactive,
+            history: Mutex::new(String::new()),
+            read_offset: Mutex::new(0),
+            // read_handler
+        })
     }
 
-    pub fn send_ctrl_c(&self) -> PyResult<()> {
-        self.write_bytes(&[0x03]) // ETX
+    fn write_to_stream(&mut self, command: &str) -> Result<(), std::io::Error> {
+        let stream = self.process.get_raw_handle().unwrap();
+
+        let buffer_writer = Mutex::new(BufWriter::new(stream));
+
+        let mut full_command = command.to_string();
+        full_command += "\n";
+
+        buffer_writer.lock().unwrap().write_all(full_command.as_bytes()).map_err(|e| {
+            println!("Failed to write to the stream: {}", e);
+            e
+        })?;
+        buffer_writer.lock().unwrap().flush().expect("failed to flush the stream");
+        Ok(())
     }
 
     pub fn get_history(&self) -> PyResult<String> {
-        let hist = self
-       .inner
-       .lock()
-       .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("internal lock poisoned"))?;
-        let (a, b) = hist.history.as_slices();
-        Ok(format!("{}{}", sanitize_for_agent(a), sanitize_for_agent(b)))
+        Ok(self.history.lock().unwrap().clone())
+    }
+
+    pub fn reset(&mut self) {
+        self.close().unwrap();
+        *self = AGTerm::new(self.command.clone(), self.interactive).unwrap();
+        let initial_state = self.read_from_stream().unwrap();
+        println!("Initial State: {}", initial_state);
     }
 
     pub fn is_alive(&self) -> PyResult<bool> {
-        let inner = self
-       .inner
-       .lock()
-       .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("internal lock poisoned"))?;
-        inner.process
-       .is_alive()
-       .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("is_alive failed: {e}")))
+        Ok(self.process.is_alive().expect("failed to check if the process is alive"))
     }
 
     pub fn is_interactive(&self) -> PyResult<bool> {
-        let inner = self
-       .inner
-       .lock()
-       .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("internal lock poisoned"))?;
-        Ok(inner.interactive)
+        Ok(self.interactive)
     }
 
     pub fn get_initial_command(&self) -> PyResult<String> {
-        let inner = self
-       .inner
-       .lock()
-       .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("internal lock poisoned"))?;
-        Ok(inner.command.clone())
+        Ok(self.command.clone())
     }
 
-    pub fn close(&self) -> PyResult<()> {
-        self.close_inner()
-       .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("close failed: {e}")))
-    }
-
-    /// Respawns the terminal process by closing the old one and initializing a new state.
-    /// Requires &mut self because it replaces the Arc and Mutex fields of the AGTerm struct itself.
-    pub fn reset(&mut self) -> PyResult<()> {
-        let (cmd, interactive, max_hist, markers) = {
-            let inner = self
-           .inner
-           .lock()
-           .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("internal lock poisoned"))?;
-            (
-                inner.command.clone(),
-                inner.interactive,
-                inner.max_history_bytes,
-                inner.ready_markers.clone(), // This is Vec<Vec<u8>>
-            )
-        };
-
-        // Close the old process and threads safely.
-        let _ = self.close_inner();
-
-        // Spawn a completely new instance with the old configuration.
-        let new_instance = Self::spawn_inner(cmd, interactive, max_hist, markers)?;
-
-        // Use mutable assignment to replace the internal state of the current AGTerm object.
-        *self = new_instance;
-
-        // Read available buffer after spawn/reset to clear initial prompt
-        let _ = self.read_available(Some(256 * 1024));
-
-        Ok(())
-    }
-}
-
-impl AGTerm {
-    // Changed signature to accept Vec<Vec<u8>> directly
-    fn spawn_inner(
-        command: String,
-        interactive: bool,
-        max_history_bytes: usize,
-        ready_markers: Vec<Vec<u8>>,
-    ) -> PyResult<Self> {
-        let os_command = Command::new(command.clone());
-        let process = PtyProcess::spawn(os_command).map_err(|e| {
-            pyo3::exceptions::PyException::new_err(format!(
-                "Failed to spawn process with command '{command}': {e}"
-            ))
-        })?;
-
-        let master = process.get_raw_handle().map_err(|e| {
-            pyo3::exceptions::PyException::new_err(format!("Failed to get pty handle: {e}"))
-        })?;
-
-        let reader_file = master.try_clone().map_err(|e| {
-            pyo3::exceptions::PyException::new_err(format!(
-                "Failed to clone pty handle (reader): {e}"
-            ))
-        })?;
-        let writer_file = master.try_clone().map_err(|e| {
-            pyo3::exceptions::PyException::new_err(format!(
-                "Failed to clone pty handle (writer): {e}"
-            ))
-        })?;
-
-        let reader = BufReader::new(reader_file);
-        let writer = BufWriter::new(writer_file);
-
-        // Switched to flume channel (Send + Sync) [3]
-        let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = flume::unbounded();
-
-        // Call as free function
-        let reader_handle = spawn_reader_thread(reader, tx);
-
-        let inner = AGTermInner {
-            process,
-            writer,
-            history: VecDeque::with_capacity(max_history_bytes),
-            max_history_bytes,
-            command,
-            interactive,
-            ready_markers, // Use byte vectors directly
-        };
-
-        Ok(Self {
-            inner: Arc::new(Mutex::new(inner)),
-            rx: Arc::new(rx),
-            reader_handle: Mutex::new(Some(reader_handle)),
-        })
-    }
-
-    fn should_wait_for_markers(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
-        if!inner.interactive {
-            return false;
-        }
-  !inner.ready_markers.is_empty()
-    }
-
-    fn close_inner(&self) -> std::io::Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        let _ = inner.process.exit(true);
-
-        // Stop the reader thread
-        if let Some(h) = self.reader_handle.lock().ok().and_then(|mut g| g.take()) {
-            let _ = h.join();
-        }
+    pub fn close(&mut self) -> PyResult<()> {
+        assert!(self.process.exit(true).expect("failed to stop the process"));
         Ok(())
     }
 
-    fn writer_lock(&self) -> PyResult<MutexGuard<'_, AGTermInner>> {
-        self.inner
-      .lock()
-      .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("writer lock poisoned"))
-    }
+    fn read_from_stream(&mut self) -> PyResult<String> {
+        let mut buf: Vec<u8> = Vec::new();
+        let timeout = 100;
 
-    fn write_bytes(&self, bytes: &[u8]) -> PyResult<()> {
-        let mut inner = self.writer_lock()?;
-        inner.writer.write_all(bytes)
-      .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("write failed: {e}")))?;
-        inner.writer.flush()
-      .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("flush failed: {e}")))?;
-        Ok(())
-    }
+        println!("Reading from the stream");
 
-    fn write_to_stream(&self, input: &str) -> PyResult<()> {
-        let mut s = input.as_bytes().to_vec();
-        s.push(b'\n');
-        self.write_bytes(&s)
-    }
+        // buf.extend_from_slice(self.initial_state.lock().unwrap().as_bytes());
+        let mut consecutive_empty_lines = 0;
+        let max_consecutive_empty_lines = 3;
 
-    fn append_history(&self, data: &[u8]) -> PyResult<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
-        let mut inner = self
-      .inner
-      .lock()
-      .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("history lock poisoned"))?;
-
-        for &b in data {
-            inner.history.push_back(b);
-        }
-        while inner.history.len() > inner.max_history_bytes {
-            inner.history.pop_front();
-        }
-        Ok(())
-    }
-
-    fn read_until_quiet_inner(
-        &self,
-        timeout_ms: u64,
-        quiet_ms: u64,
-        max_output_bytes: usize,
-    ) -> PyResult<(Vec<u8>, bool)> {
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        let quiet = Duration::from_millis(quiet_ms);
-
-        let rx = self.rx.as_ref();
-        let mut out: Vec<u8> = Vec::new();
-        let mut truncated = false;
-        let mut saw_any = false;
-        let mut last_activity = Instant::now();
-
-        loop {
-            if out.len() >= max_output_bytes {
-                truncated = true;
-                break;
-            }
-            if Instant::now() >= deadline {
-                break;
-            }
-            if saw_any && Instant::now().duration_since(last_activity) >= quiet {
-                break;
-            }
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let slice_wait = remaining.min(Duration::from_millis(25));
-
-            let chunk_opt = match rx.recv_timeout(slice_wait) {
-                Ok(chunk) => Some(chunk),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => break,
-            };
-
-            if let Some(chunk) = chunk_opt {
-                saw_any = true;
-                last_activity = Instant::now();
-
-                let remaining_cap = max_output_bytes - out.len();
-                if chunk.len() <= remaining_cap {
-                    out.extend_from_slice(&chunk);
-                } else {
-                    out.extend_from_slice(&chunk[..remaining_cap]);
-                    truncated = true;
+        for __ in 0..timeout {
+            // print!(".");
+            match self.buffer_read_channel.lock().unwrap().try_recv() {
+                Ok(line) => {
+                    // println!("<CHANNEL_READ_STRING> {} <CHANNEL_READ_STRING>", line);
+                    // thread::sleep(time::Duration::from_millis(1));
+                    buf.extend_from_slice(line.as_bytes());
+                    if line != "\n" {
+                        consecutive_empty_lines = 0;
+                    };
                 }
-            }
-        }
-
-        self.append_history(&out)?;
-        Ok((out, truncated))
-    }
-
-    fn read_until_ready_inner(
-        &self,
-        timeout_ms: u64,
-        max_output_bytes: usize,
-        settle_ms: u64,
-    ) -> PyResult<(Vec<u8>, bool, bool, Option<Vec<u8>>)> {
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        let settle = Duration::from_millis(settle_ms);
-
-        let markers = {
-            let inner = self.inner.lock().unwrap();
-            inner.ready_markers.clone()
-        };
-
-        let rx = self.rx.as_ref();
-
-        let mut out: Vec<u8> = Vec::new();
-        let mut truncated = false;
-        let mut saw_marker = false;
-        let mut which: Option<Vec<u8>> = None;
-
-        loop {
-            if out.len() >= max_output_bytes {
-                truncated = true;
-                break;
-            }
-            if Instant::now() >= deadline {
-                break;
-            }
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let slice_wait = remaining.min(Duration::from_millis(50));
-
-            let chunk_opt = match rx.recv_timeout(slice_wait) {
-                Ok(chunk) => Some(chunk),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => break,
-            };
-
-            if let Some(chunk) = chunk_opt {
-                let remaining_cap = max_output_bytes - out.len();
-                if chunk.len() <= remaining_cap {
-                    out.extend_from_slice(&chunk);
-                } else {
-                    out.extend_from_slice(&chunk[..remaining_cap]);
-                    truncated = true;
-                }
-
-                if markers.is_empty() {
+                // Err(e) => {
+                //     println!("Error while reading: {}", e);
+                //     break;
+                // }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // println!("Empty line");
+                    if consecutive_empty_lines >= 0 && self.interactive {
+                        thread::sleep(time::Duration::from_secs(2));
+                        // thread::sleep(time::Duration::from_millis(5));
+                        // continue;
+                    }
+                    consecutive_empty_lines += 1;
+                    if consecutive_empty_lines >= max_consecutive_empty_lines {
+                        // println!("Breaking cause of consecutive empty lines: 137");
+                        break;
+                    }
+                    // break;
                     continue;
                 }
-
-                let tail = if out.len() > 8192 { &out[out.len() - 8192..] } else { &out[..] };
-                let tail_s = sanitize_for_agent(tail);
-
-                for m in &markers {
-                    let ms = String::from_utf8_lossy(m);
-                    let pat: &str = ms.as_ref();
-                    if tail_s.ends_with(pat) || tail_s.contains(pat) {
-                        saw_marker = true;
-                        which = Some(m.clone());
-                        break;
-                    }
-                }
-
-                if saw_marker {
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    println!("Error: Channel disconnected");
                     break;
                 }
             }
         }
 
-        if saw_marker &&!truncated {
-            let settle_deadline = Instant::now() + settle;
-            loop {
-                if out.len() >= max_output_bytes {
-                    truncated = true;
-                    break;
-                }
-                if Instant::now() >= settle_deadline {
-                    break;
-                }
-                let chunk_opt = match rx.recv_timeout(Duration::from_millis(25)) {
-                    Ok(chunk) => Some(chunk),
-                    Err(RecvTimeoutError::Timeout) => None,
-                    Err(RecvTimeoutError::Disconnected) => break,
-                };
-                match chunk_opt {
-                    Some(chunk) => {
-                        let remaining_cap = max_output_bytes - out.len();
-                        if chunk.len() <= remaining_cap {
-                            out.extend_from_slice(&chunk);
-                        } else {
-                            out.extend_from_slice(&chunk[..remaining_cap]);
-                            truncated = true;
-                        }
-                    }
-                    None => break,
-                }
-            }
-        }
+        let s = match str::from_utf8(&buf) {
+            Ok(v) => v.to_string(),
+            Err(e) => panic!("Invalid UTF-8 sequence: {}", e),
+        };
 
-        self.append_history(&out)?;
-        Ok((out, truncated, saw_marker, which))
+        // print!("<String_READ_BEGIN> {} <String_READ_END>", s);
+
+        // Append new data to history and determine the new portion to return
+        let mut history = self.history.lock().unwrap();
+        let mut read_offset = self.read_offset.lock().unwrap();
+
+        let previous_offset = *read_offset;
+        history.push_str(&s);
+
+        let new_data = history[previous_offset..].to_string();
+        *read_offset = history.len();
+
+        Ok(new_data)
+    }
+
+    pub fn execute_command(&mut self, command: &str) -> PyResult<String> {
+
+        match self.write_to_stream(command) {
+            Ok(_) => {
+                // println!("Successfully wrote to the stream");
+            },
+            Err(e) => println!("Failed to write to the stream: {}", e),
+        };
+
+        let res = self.read_from_stream().unwrap();
+        // res = self.initial_state.lock().unwrap().clone() + &res;
+        // println!("\nRESULT_START {} RESULT_END", res);
+        Ok(res)
     }
 }
 
-fn spawn_reader_thread(mut reader: BufReader<File>, tx: Sender<Vec<u8>>) -> JoinHandle<()> {
-    std::thread::Builder::new()
-  .name("agterm_reader".to_string())
-  .spawn(move |
+//reads from reader and writes to the sender channel
+fn spawn_reader_channel<T>(mut reader: BufReader<File>, sender_channel: &Sender<String>, _timeout: i32) -> JoinHandle<()> {
+    let tx = sender_channel.clone();
+    // let mut len_buf: Vec<u8> = Vec::new();
 
-| {
-            let mut buffer = vec![0u8; 8192];
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if tx.send(buffer[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        // PTYs often return EIO when the slave closes.
-                        if matches!(e.raw_os_error(), Some(5)) {
-                            break;
-                        }
-                        break;
-                    }
+    let handler = thread::Builder::new().name("blocking_reader_thread".to_string()).spawn(move || loop {
+        thread::sleep(time::Duration::from_millis(5));
+        let mut buffer: Vec<u8> = vec![0; 8];
+        match reader.read(&mut buffer) {
+            Ok(num_bytes) => {
+                if num_bytes == 0 {
+                    println!("breaking cause 0 bytes");
+                    break;
+                }
+                // &buffer[..num_bytes].to_ascii_lowercase();
+
+                // println!("xor res: {:?}", &buffer[..num_bytes].cmp(&31));
+                // println!("escape char bool: {:?}", &buffer[..num_bytes].xor_bit(&[0b00011111u8]));
+
+                // println!("<READER_READ_NUM_BYTES> {} <READER_READ_NUM_BYTES>", num_bytes);
+                // let byte_str = b"00011111";
+                // assert_eq!(byte_str, &*byte_vec);
+
+                // print!("<READER_READ_RAW_BYTES> {:?} <READER_READ_RAW_BYTES>", &buffer[..num_bytes].escape_ascii().to_string());
+                // print!("<READER_READ_BYTES_TO_STRING> {:?} <READER_READ_BYTES_TO_STRING>", &buffer[..num_bytes]);
+
+                // let line = String::from_utf8_lossy(&buffer[..num_bytes].escape_ascii().to_string()).to_string();
+                // let line = String::from_utf8();
+                let line = buffer[..num_bytes].escape_ascii().to_string();
+                if line.is_empty() {
+                    // println!("breaking cause empty line");
+                    continue;
+                }
+                // println!("<READER_READ_STRING> {} <READER_READ_STRING>", line);
+                tx.send(line).unwrap();
+                thread::sleep(time::Duration::from_millis(1));
+            }
+            Err(e) => {
+                let raw_error = e.raw_os_error().unwrap();
+                if raw_error == 5 {
+                    // this is the last thing to exit right now
+                    print!("Process Exited");
+                    // println!("sleep indefinitely because of error 5");
+                    // thread::sleep(time::Duration::from_secs(4000));
+                    // println!("Reached EOF");
+                    // continue;
+                    // println!("Reached EOF");
+                    break;
+                } else {
+                    println!("Error while reading: {}, Raw Error: {}", e, raw_error);
+                    break;
                 }
             }
-        })
-  .expect("failed to spawn reader thread")
+        }
+    }).unwrap();
+    handler
 }
 
-fn sanitize_for_agent(bytes: &[u8]) -> String {
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
 
-    while i < bytes.len() {
-        let b = bytes[i];
+pub fn read_from_channel(read_channel: Receiver<String>, timeout: i32) -> Result<String, Box<dyn std::error::Error>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let timeout = 100;
 
-        if b == 0x1b {
-            if i + 1 >= bytes.len() {
+    // println!("Reading from the stream");
+
+    // buf.extend_from_slice(self.initial_state.as_bytes());
+    let mut consecutive_empty_lines = 0;
+    let max_consecutive_empty_lines = 100;
+    for __ in 0..timeout {
+        // print!(".");
+        match read_channel.try_recv() {
+            Ok(line) => {
+                buf.extend_from_slice(line.as_bytes());
+                consecutive_empty_lines = 0;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if consecutive_empty_lines >= 1 {
+                    thread::sleep(time::Duration::from_secs(1));
+                    // continue;
+                }
+                consecutive_empty_lines += 1;
+                if consecutive_empty_lines >= max_consecutive_empty_lines {
+                    // println!("Breaking cause of consecutive empty lines");
+                    break;
+                }
+                // break;
+                continue;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                println!("Error: Channel disconnected");
                 break;
             }
-            let b2 = bytes[i + 1];
-
-            // CSI: ESC [... final-byte(@..~)
-            if b2 == b'[' {
-                i += 2;
-                while i < bytes.len() {
-                    let c = bytes[i];
-                    if (0x40..=0x7e).contains(&c) {
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-                continue;
-            }
-
-            // OSC: ESC ]... BEL or ESC \
-            if b2 == b']' {
-                i += 2;
-                while i < bytes.len() {
-                    if bytes[i] == 0x07 {
-                        i += 1;
-                        break;
-                    }
-                    if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
-                        i += 2;
-                        break;
-                    }
-                    i += 1;
-                }
-                continue;
-            }
-
-            // DCS / PM / APC: ESC P / ESC ^ / ESC _... ESC \
-            if b2 == b'P' || b2 == b'^' || b2 == b'_' {
-                i += 2;
-                while i < bytes.len() {
-                    if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
-                        i += 2;
-                        break;
-                    }
-                    i += 1;
-                }
-                continue;
-            }
-
-            // Other ESC sequences: skip ESC plus following byte.
-            i += 2;
-            continue;
         }
-
-        // Keep \n and \t, drop other control chars; normalize away \r
-        if b == b'\r' {
-            i += 1;
-            continue;
-        }
-        if b < 0x20 && b!= b'\n' && b!= b'\t' {
-            i += 1;
-            continue;
-        }
-
-        out.push(b);
-        i += 1;
     }
 
-    String::from_utf8_lossy(&out).to_string()
+    let s = match str::from_utf8(&buf) {
+        Ok(v) => v.to_string(),
+        Err(e) => panic!("Invalid UTF-8 sequence: {}", e),
+    };
+    Ok(s)
+    // Ok(new_data)
 }
 
+/// A Python module implemented in Rust.
 #[pymodule(name="agterm", gil_used = false)]
 fn agterm(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AGTerm>()?;
