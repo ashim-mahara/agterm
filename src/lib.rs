@@ -1,9 +1,7 @@
 use ptyprocess::PtyProcess;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
-// Fix: Import MutexGuard
 use std::sync::{Arc, Mutex, MutexGuard};
-// Removed pyo3::sync::MutexExt import as it was unused and generating a warning
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -20,13 +18,12 @@ const DEFAULT_SETTLE_MS: u64 = 200;
 const DEFAULT_QUIET_MS: u64 = 80;
 
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
-const DEFAULT_MAX_HISTORY_BYTES: usize = 4 * 1024 * 1024;
 
 const DEFAULT_READY_MARKERS: [&str; 2] = ["pwndbg> ", "(gdb) "];
 
 // --- New internal structure to hold thread-safe state ---
 struct AGTermInner {
-    // Protected non-Send/Sync type
+    // Contains non-Send/Sync types (PtyProcess, File handle)
     process: PtyProcess,
     writer: BufWriter<File>,
 
@@ -39,10 +36,17 @@ struct AGTermInner {
     ready_markers: Vec<Vec<u8>>,
 }
 
+// CRITICAL FIX: Manually implement the Send marker trait.
+// This is required because PtyProcess and File handles are not automatically Send/Sync
+// but since they are wrapped and protected by an external Mutex, we assert that
+// it is logically safe to send the *container* across threads.
+// This relies entirely on the correct use of the Mutex in AGTerm.
+unsafe impl Send for AGTermInner {}
+
 // Removed #[pyclass(unsendable)] - now relies on fields being Send + Sync
 #[pyclass]
 struct AGTerm {
-    // Arc<Mutex<T>> makes the primary state Send + Sync
+    // Arc<Mutex<T>> makes the primary state Send + Sync if T is Send
     inner: Arc<Mutex<AGTermInner>>,
 
     // Flume Receiver is Send + Sync
@@ -68,9 +72,9 @@ impl AGTerm {
 
     pub fn set_ready_markers(&self, ready_markers: Vec<String>) -> PyResult<()> {
         let mut inner = self
-         .inner
-         .lock()
-         .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("internal lock poisoned"))?;
+       .inner
+       .lock()
+       .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("internal lock poisoned"))?;
 
         inner.ready_markers.clear();
         for s in ready_markers {
@@ -93,9 +97,8 @@ impl AGTerm {
         let settle_ms = settle_ms.unwrap_or(DEFAULT_SETTLE_MS);
         let quiet_ms = quiet_ms.unwrap_or(DEFAULT_QUIET_MS);
 
-        // Use py.allow_threads to release GIL during blocking I/O
-        #[allow(deprecated)]
-        py.allow_threads(|| {
+        // Replaced deprecated py.allow_threads with py.detach
+        py.detach(|| {
             let raw = if self.should_wait_for_markers() {
                 let (raw, _tr, _seen, _which) =
                     self.read_until_ready_inner(timeout_ms, max_output_bytes, settle_ms)?;
@@ -125,8 +128,8 @@ impl AGTerm {
 
         self.write_to_stream(input)?;
 
-        #[allow(deprecated)]
-        py.allow_threads(|| {
+        // Replaced deprecated py.allow_threads with py.detach
+        py.detach(|| {
             let raw = if self.should_wait_for_markers() {
                 let (raw, _tr, _seen, _which) =
                     self.read_until_ready_inner(timeout_ms, max_output_bytes, settle_ms)?;
@@ -172,42 +175,42 @@ impl AGTerm {
 
     pub fn get_history(&self) -> PyResult<String> {
         let hist = self
-         .inner
-         .lock()
-         .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("internal lock poisoned"))?;
+       .inner
+       .lock()
+       .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("internal lock poisoned"))?;
         let (a, b) = hist.history.as_slices();
         Ok(format!("{}{}", sanitize_for_agent(a), sanitize_for_agent(b)))
     }
 
     pub fn is_alive(&self) -> PyResult<bool> {
         let inner = self
-         .inner
-         .lock()
-         .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("internal lock poisoned"))?;
+       .inner
+       .lock()
+       .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("internal lock poisoned"))?;
         inner.process
-         .is_alive()
-         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("is_alive failed: {e}")))
+       .is_alive()
+       .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("is_alive failed: {e}")))
     }
 
     pub fn is_interactive(&self) -> PyResult<bool> {
         let inner = self
-         .inner
-         .lock()
-         .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("internal lock poisoned"))?;
+       .inner
+       .lock()
+       .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("internal lock poisoned"))?;
         Ok(inner.interactive)
     }
 
     pub fn get_initial_command(&self) -> PyResult<String> {
         let inner = self
-         .inner
-         .lock()
-         .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("internal lock poisoned"))?;
+       .inner
+       .lock()
+       .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("internal lock poisoned"))?;
         Ok(inner.command.clone())
     }
 
     pub fn close(&self) -> PyResult<()> {
         self.close_inner()
-         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("close failed: {e}")))
+       .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("close failed: {e}")))
     }
 
     /// Respawns the terminal process by closing the old one and initializing a new state.
@@ -215,9 +218,9 @@ impl AGTerm {
     pub fn reset(&mut self) -> PyResult<()> {
         let (cmd, interactive, max_hist, markers) = {
             let inner = self
-             .inner
-             .lock()
-             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("internal lock poisoned"))?;
+           .inner
+           .lock()
+           .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("internal lock poisoned"))?;
             (
                 inner.command.clone(),
                 inner.interactive,
@@ -230,7 +233,6 @@ impl AGTerm {
         let _ = self.close_inner();
 
         // Spawn a completely new instance with the old configuration.
-        // FIX: markers is Vec<Vec<u8>>, which is what spawn_inner now accepts
         let new_instance = Self::spawn_inner(cmd, interactive, max_hist, markers)?;
 
         // Use mutable assignment to replace the internal state of the current AGTerm object.
@@ -244,7 +246,7 @@ impl AGTerm {
 }
 
 impl AGTerm {
-    // FIX: Changed signature to accept Vec<Vec<u8>> directly
+    // Changed signature to accept Vec<Vec<u8>> directly
     fn spawn_inner(
         command: String,
         interactive: bool,
@@ -276,16 +278,16 @@ impl AGTerm {
         let reader = BufReader::new(reader_file);
         let writer = BufWriter::new(writer_file);
 
-        // Switched to flume channel (Send + Sync)
+        // Switched to flume channel (Send + Sync) [3]
         let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = flume::unbounded();
 
-        // FIX: Call as free function
+        // Call as free function
         let reader_handle = spawn_reader_thread(reader, tx);
 
         let inner = AGTermInner {
             process,
             writer,
-            history: VecDeque::with_capacity(64 * 1024),
+            history: VecDeque::with_capacity(max_history_bytes),
             max_history_bytes,
             command,
             interactive,
@@ -304,7 +306,7 @@ impl AGTerm {
         if!inner.interactive {
             return false;
         }
-     !inner.ready_markers.is_empty()
+  !inner.ready_markers.is_empty()
     }
 
     fn close_inner(&self) -> std::io::Result<()> {
@@ -320,16 +322,16 @@ impl AGTerm {
 
     fn writer_lock(&self) -> PyResult<MutexGuard<'_, AGTermInner>> {
         self.inner
-         .lock()
-         .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("writer lock poisoned"))
+      .lock()
+      .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("writer lock poisoned"))
     }
 
     fn write_bytes(&self, bytes: &[u8]) -> PyResult<()> {
         let mut inner = self.writer_lock()?;
         inner.writer.write_all(bytes)
-         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("write failed: {e}")))?;
+      .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("write failed: {e}")))?;
         inner.writer.flush()
-         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("flush failed: {e}")))?;
+      .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("flush failed: {e}")))?;
         Ok(())
     }
 
@@ -344,9 +346,9 @@ impl AGTerm {
             return Ok(());
         }
         let mut inner = self
-         .inner
-         .lock()
-         .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("history lock poisoned"))?;
+      .inner
+      .lock()
+      .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("history lock poisoned"))?;
 
         for &b in data {
             inner.history.push_back(b);
@@ -469,9 +471,7 @@ impl AGTerm {
                 for m in &markers {
                     let ms = String::from_utf8_lossy(m);
                     let pat: &str = ms.as_ref();
-                    // FIX: Ensure correct logical OR syntax
-                    if tail_s.ends_with(pat) ||
-                       tail_s.contains(pat) {
+                    if tail_s.ends_with(pat) || tail_s.contains(pat) {
                         saw_marker = true;
                         which = Some(m.clone());
                         break;
@@ -521,8 +521,8 @@ impl AGTerm {
 
 fn spawn_reader_thread(mut reader: BufReader<File>, tx: Sender<Vec<u8>>) -> JoinHandle<()> {
     std::thread::Builder::new()
-     .name("agterm_reader".to_string())
-     .spawn(move |
+  .name("agterm_reader".to_string())
+  .spawn(move |
 
 | {
             let mut buffer = vec![0u8; 8192];
@@ -544,7 +544,7 @@ fn spawn_reader_thread(mut reader: BufReader<File>, tx: Sender<Vec<u8>>) -> Join
                 }
             }
         })
-     .expect("failed to spawn reader thread")
+  .expect("failed to spawn reader thread")
 }
 
 fn sanitize_for_agent(bytes: &[u8]) -> String {
@@ -592,7 +592,6 @@ fn sanitize_for_agent(bytes: &[u8]) -> String {
             }
 
             // DCS / PM / APC: ESC P / ESC ^ / ESC _... ESC \
-            // FIX: Use correct logical OR syntax on a single line
             if b2 == b'P' || b2 == b'^' || b2 == b'_' {
                 i += 2;
                 while i < bytes.len() {
